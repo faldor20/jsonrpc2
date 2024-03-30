@@ -81,6 +81,19 @@ func (c *Conn) Call(ctx context.Context, method string, params, result interface
 	return call.Wait(ctx, result)
 }
 
+// Call initiates a JSON-RPC call using the specified method and params, and
+// waits for the response. If the response is successful, its result is stored
+// in result (a pointer to a value that can be JSON-unmarshaled into);
+// otherwise, a non-nil error is returned. See DispatchCall for more details.
+func (c *Conn) CallRaw(ctx context.Context, method string, params interface{}, opts ...CallOption) (*json.RawMessage, error) {
+
+	call, err := c.DispatchCall(ctx, method, params, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return call.WaitRaw(ctx)
+}
+
 // DisconnectNotify returns a channel that is closed when the
 // underlying connection is disconnected.
 func (c *Conn) DisconnectNotify() <-chan struct{} {
@@ -166,7 +179,9 @@ func (c *Conn) SendResponse(ctx context.Context, resp *Response) error {
 }
 
 func (c *Conn) close(cause error) error {
+	c.sending.Lock()
 	c.mu.Lock()
+	defer c.sending.Unlock()
 	defer c.mu.Unlock()
 
 	if c.closed {
@@ -246,17 +261,6 @@ func (c *Conn) readMessages(ctx context.Context) {
 func (c *Conn) send(_ context.Context, m *anyMessage, wait bool) (cc *call, err error) {
 	c.sending.Lock()
 	defer c.sending.Unlock()
-
-	// double check the error isn't due to being closed while sending.
-	defer func() {
-		if err != nil {
-			c.mu.Lock()
-			if c.closed {
-				err = ErrClosed
-			}
-			c.mu.Unlock()
-		}
-	}()
 
 	// m.request.ID could be changed, so we store a copy to correctly
 	// clean up pending
@@ -358,6 +362,29 @@ func (w Waiter) Wait(ctx context.Context, result interface{}) error {
 
 	case <-ctx.Done():
 		return ctx.Err()
+	}
+}
+
+// Wait for the result of an ongoing JSON-RPC call. If the response
+// is successful, its result is stored in result (a pointer to a
+// value that can be JSON-unmarshaled into); otherwise, a non-nil
+// error is returned.
+func (w Waiter) WaitRaw(ctx context.Context) (*json.RawMessage, error) {
+	select {
+	case err, ok := <-w.call.done:
+		if !ok {
+			err = ErrClosed
+		}
+		if err != nil {
+			return nil, err
+		}
+		if w.call.response.Result == nil {
+			w.call.response.Result = &jsonNull
+		}
+		return w.call.response.Result, nil
+
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	}
 }
 
